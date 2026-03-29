@@ -1,0 +1,8 @@
+moodle_offline/
+__pycache__/
+*.log
+*.pyc
+mapping.json
+cahier_prepa_offline/
+cahier_prepa_test/
+.env
