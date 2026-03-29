@@ -1,0 +1,8 @@
+moodle_offline/
+__pycache__/
+*.log
+*.pyc
+mapping.json
+mot de passe*.txt
+motdepasse*.txt
+.env
