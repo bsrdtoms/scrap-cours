@@ -565,7 +565,11 @@ class MoodleScraper:
         for tag in soup.find_all("a", href=True):
             href = self.abs_url(tag["href"])
             if href in self.url_map:
+                # Lien téléchargé → chemin local relatif
                 tag["href"] = self.relpath(self.url_map[href], html_path)
+            elif self.is_moodle_url(href) or tag["href"].startswith("/"):
+                # Lien interne Moodle non téléchargé → désactiver
+                tag["href"] = "#"
 
         for tag in soup.find_all("base"):
             tag.decompose()
