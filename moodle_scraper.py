@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Moodle Offline Scraper
-======================
-Crée un miroir local entièrement navigable d'un site Moodle.
+Moodle Offline Scraper — Universel
+===================================
+Crée un miroir local entièrement navigable de n'importe quel Moodle.
 Inspiré de enregistrer-un-site-cahier-de-prepa (bsrdtoms).
 
+Usage :
+  python moodle_scraper.py                    ← demande l'URL au lancement
+  python moodle_scraper.py --url https://...  ← URL directement
+  python moodle_scraper.py --test             ← mode test (2 cours)
+
+Authentification automatique :
+  - CAS (ex. ENSAI)         → login automatique username/password
+  - Formulaire standard     → login automatique username/password
+  - SSO/OAuth/Shibboleth    → fenêtre Chrome ouverte pour login manuel
+
 Structure générée :
-  moodle_offline/
-  ├── index.html               ← page d'accueil (liste des cours)
-  ├── assets/                  ← CSS, JS, fonts, images du thème
+  moodle_offline_<domaine>/
+  ├── index.html
+  ├── assets/
   ├── cours/
-  │   ├── nom_du_cours/
-  │   │   ├── index.html       ← page principale du cours
-  │   │   ├── fichiers/        ← PDFs, DOCX, etc.
-  │   │   └── pages/           ← pages Moodle inline
-  │   └── ...
-  └── moodle_scraper.log
+  │   └── nom_cours/
+  │       ├── index.html
+  │       ├── fichiers/
+  │       └── pages/
+  └── mapping.json
 """
 
 import os
@@ -32,38 +41,40 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
 
-# ============================================================
-# CONFIGURATION — modifiez ici si nécessaire
-# ============================================================
-MOODLE_URL   = "https://foad-moodle.ensai.fr"
-OUTPUT_DIR   = Path(__file__).parent / "moodle_offline"
-LOG_FILE     = Path(__file__).parent / "moodle_scraper.log"
-DELAY        = 0.3   # secondes entre les requêtes (respecter le serveur)
+DELAY = 0.3  # secondes entre les requêtes (respecter le serveur)
 
 # ============================================================
-# LOGGING
+# LOGGING — configuré dynamiquement dans main()
 # ============================================================
-_stream_handler = logging.StreamHandler(sys.stdout)
-_stream_handler.stream = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        _stream_handler,
-    ],
-)
 log = logging.getLogger(__name__)
+
+
+def setup_logging(log_file: Path):
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    stream = logging.StreamHandler(sys.stdout)
+    try:
+        stream.stream = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
+    except Exception:
+        pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            stream,
+        ],
+    )
 
 
 # ============================================================
 # SCRAPER
 # ============================================================
 class MoodleScraper:
-    def __init__(self, username, password, output_dir=OUTPUT_DIR,
+    def __init__(self, moodle_url, output_dir,
+                 username=None, password=None,
                  test_mode=False, max_courses=None):
-        self.base_url    = MOODLE_URL.rstrip("/")
+        self.base_url    = moodle_url.rstrip("/")
         self.username    = username
         self.password    = password
         self.output_dir  = Path(output_dir)
@@ -79,28 +90,23 @@ class MoodleScraper:
             )
         })
 
-        # Stats
-        self.pages_saved       = 0
-        self.files_downloaded  = 0
-        self.files_failed      = []
-        self.start_time        = time.time()
-
-        # Mapping URL Moodle → chemin local (pour réécriture des liens)
-        self.url_map           = {}   # url → Path absolu local
-        self.assets_done       = set()
+        self.pages_saved      = 0
+        self.files_downloaded = 0
+        self.files_failed     = []
+        self.start_time       = time.time()
+        self.url_map          = {}
+        self.assets_done      = set()
 
     # ----------------------------------------------------------
     # UTILITAIRES
     # ----------------------------------------------------------
     def sanitize(self, name, max_len=80):
-        """Nettoie un nom pour en faire un nom de fichier/dossier valide."""
         name = unquote(name)
         name = re.sub(r"[\\/:*?\"<>|\r\n\t]", "_", name)
         name = re.sub(r"\s+", "_", name).strip("._")
         return name[:max_len] or "sans_nom"
 
     def abs_url(self, href):
-        """Retourne l'URL absolue depuis une href."""
         if not href:
             return ""
         if href.startswith("http"):
@@ -108,19 +114,15 @@ class MoodleScraper:
         return urljoin(self.base_url, href)
 
     def is_moodle_url(self, url):
-        """Vérifie si l'URL appartient à ce Moodle."""
         return url.startswith(self.base_url)
 
     def relpath(self, target, base_file):
-        """Chemin relatif de target par rapport au dossier de base_file."""
         try:
             return os.path.relpath(str(target), str(Path(base_file).parent))
         except ValueError:
-            # Sur Windows si les lecteurs diffèrent
             return str(target)
 
     def get(self, url, **kwargs):
-        """GET avec gestion des erreurs et délai."""
         time.sleep(DELAY)
         try:
             r = self.session.get(url, timeout=60, **kwargs)
@@ -135,97 +137,107 @@ class MoodleScraper:
     def login(self):
         """
         Connexion à Moodle.
-        Détecte automatiquement CAS (ssocas.ensai.fr) ou formulaire standard.
+        Détecte automatiquement le type d'auth :
+          - CAS              → login automatique (requests)
+          - Formulaire std   → login automatique (requests)
+          - SSO/OAuth/Shib   → fenêtre Chrome (login manuel)
         """
         login_url = f"{self.base_url}/login/index.php"
-        log.info("Connexion à Moodle...")
+        log.info(f"Connexion à {self.base_url} ...")
 
         r = self.get(login_url)
         if not r:
             raise Exception("Impossible d'accéder à la page de login")
 
-        # --- Détecter si on est redirigé vers CAS ---
-        if "ssocas" in r.url or "cas" in r.url:
+        final_url = r.url
+        domain    = urlparse(self.base_url).netloc
+
+        # Déjà connecté ?
+        if domain in final_url and "login" not in final_url:
+            log.info("✓ Déjà connecté")
+            return True
+
+        # CAS (ssocas.ensai.fr ou tout serveur cas.*)
+        if "ssocas" in final_url or re.search(r"//cas\.", final_url):
+            self._ensure_credentials("CAS")
             return self._login_cas(r)
-        else:
-            return self._login_standard(r)
+
+        # Formulaire Moodle standard (reste sur le domaine Moodle)
+        if domain in final_url:
+            soup = BeautifulSoup(r.text, "html.parser")
+            if soup.find("input", {"name": "logintoken"}) or soup.find("input", {"name": "username"}):
+                self._ensure_credentials("formulaire Moodle")
+                return self._login_standard(r)
+
+        # Tout autre SSO (Shibboleth, Microsoft OAuth, Google, etc.)
+        log.info(f"  SSO détecté (redirection vers {final_url.split('?')[0]})")
+        return self._login_browser(login_url)
+
+    def _ensure_credentials(self, auth_type):
+        """Demande username/password si pas déjà définis."""
+        if not self.username:
+            self.username = input(f"  [{auth_type}] Email / username : ").strip()
+        if not self.password:
+            self.password = getpass.getpass(f"  [{auth_type}] Mot de passe    : ")
 
     def _login_cas(self, r):
-        """Login via CAS (Central Authentication Service) de l'ENSAI."""
+        """Login via CAS (Central Authentication Service)."""
         cas_url = r.url
-        log.info(f"  CAS detecte : {cas_url.split('?')[0]}")
+        log.info(f"  CAS détecté : {cas_url.split('?')[0]}")
 
         soup = BeautifulSoup(r.text, "html.parser")
         form = soup.find("form")
         if not form:
             raise Exception("Formulaire CAS introuvable")
 
-        # Recuperer TOUS les champs caches (execution, _eventId, geolocation...)
-        data = {}
-        for inp in form.find_all("input"):
-            name  = inp.get("name", "")
-            value = inp.get("value", "")
-            if name:
-                data[name] = value
-
-        # Injecter les identifiants (essai 1 : username complet)
-        data["username"]   = self.username
-        data["password"]   = self.password
-        data["_eventId"]   = "submit"
+        data = {inp.get("name", ""): inp.get("value", "")
+                for inp in form.find_all("input") if inp.get("name")}
+        data["username"]    = self.username
+        data["password"]    = self.password
+        data["_eventId"]    = "submit"
         data["geolocation"] = ""
 
-        # POST vers l'action du formulaire CAS
         action = form.get("action", "")
         if not action.startswith("http"):
             action = urljoin(cas_url, action)
 
-        log.info(f"  POST CAS : {action.split('?')[0]}")
-        log.info(f"  Champs : {list(data.keys())}")
-
         time.sleep(DELAY)
         r2 = self.session.post(action, data=data, timeout=30, allow_redirects=True)
-        log.info(f"  Reponse : {r2.status_code} {r2.url[:80]}")
 
-        # Si encore sur CAS → essayer avec username court (sans @ensai.fr)
-        if "ssocas" in r2.url:
+        # 2e tentative avec username court (sans @domaine)
+        if "cas" in r2.url or "ssocas" in r2.url:
             soup2 = BeautifulSoup(r2.text, "html.parser")
             form2 = soup2.find("form")
             if form2:
-                data2 = {inp.get("name",""): inp.get("value","")
+                data2 = {inp.get("name", ""): inp.get("value", "")
                          for inp in form2.find_all("input") if inp.get("name")}
                 short = self.username.split("@")[0] if "@" in self.username else self.username
-                data2["username"]    = short
-                data2["password"]    = self.password
-                data2["_eventId"]    = "submit"
-                data2["geolocation"] = ""
+                data2.update(username=short, password=self.password,
+                             _eventId="submit", geolocation="")
                 action2 = form2.get("action", "")
                 if not action2.startswith("http"):
                     action2 = urljoin(r2.url, action2)
-                log.info(f"  2e tentative avec username : {short}")
+                log.info(f"  2e tentative : {short}")
                 time.sleep(DELAY)
                 r2 = self.session.post(action2, data=data2, timeout=30, allow_redirects=True)
-                log.info(f"  Reponse 2 : {r2.status_code} {r2.url[:80]}")
 
-        # Echec definitif si encore sur CAS
-        if "ssocas" in r2.url:
+        if "cas" in r2.url or "ssocas" in r2.url:
             soup_err = BeautifulSoup(r2.text, "html.parser")
             err = (soup_err.find(class_="errors") or
                    soup_err.find(id="msg") or
                    soup_err.find(class_="alert"))
-            msg = err.get_text(strip=True) if err else "identifiants incorrects"
-            raise Exception(f"Connexion CAS echouee : {msg}")
+            raise Exception(f"Connexion CAS échouée : {err.get_text(strip=True) if err else 'identifiants incorrects'}")
 
-        # Verifier la session Moodle
         time.sleep(DELAY)
         r3 = self.session.get(f"{self.base_url}/my/", timeout=30)
-        if "login" in r3.url or "ssocas" in r3.url:
-            raise Exception("Session Moodle non etablie apres CAS")
+        if "login" in r3.url:
+            raise Exception("Session Moodle non établie après CAS")
 
-        log.info("Connexion CAS reussie")
+        log.info("✓ Connexion CAS réussie")
         return True
 
     def _login_standard(self, r):
-        """Login via formulaire Moodle standard."""
+        """Login via formulaire Moodle standard (username/password)."""
         soup = BeautifulSoup(r.text, "html.parser")
         token_input = soup.find("input", {"name": "logintoken"})
         logintoken  = token_input["value"] if token_input else ""
@@ -243,19 +255,73 @@ class MoodleScraper:
         if "login" in r2.url:
             soup2 = BeautifulSoup(r2.text, "html.parser")
             err = soup2.find(class_="loginerrors") or soup2.find(id="loginerrormessage")
-            msg = err.get_text(strip=True) if err else "vérifiez vos identifiants"
-            raise Exception(f"Connexion échouée : {msg}")
+            raise Exception(f"Connexion échouée : {err.get_text(strip=True) if err else 'vérifiez vos identifiants'}")
 
         log.info("✓ Connexion réussie")
+        return True
+
+    def _login_browser(self, login_url):
+        """
+        Ouvre une fenêtre Chrome visible pour login manuel (SSO/OAuth/Shibboleth).
+        Transfère automatiquement les cookies vers la session requests.
+        """
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options as ChromeOptions
+            from selenium.webdriver.support.ui import WebDriverWait
+        except ImportError:
+            raise Exception(
+                "Selenium requis pour ce type de connexion.\n"
+                "Installe-le avec : pip install selenium"
+            )
+
+        log.info("=" * 60)
+        log.info("  CONNEXION MANUELLE REQUISE")
+        log.info("  → Une fenêtre Chrome va s'ouvrir.")
+        log.info("  → Connecte-toi normalement (SSO, Microsoft, etc.).")
+        log.info("  → La fenêtre se ferme automatiquement après connexion.")
+        log.info("=" * 60)
+
+        opts = ChromeOptions()
+        opts.add_argument("--start-maximized")
+        driver = webdriver.Chrome(options=opts)
+
+        try:
+            driver.get(login_url)
+            domain = urlparse(self.base_url).netloc
+
+            log.info("En attente de connexion (3 min max)...")
+            WebDriverWait(driver, 180).until(
+                lambda d: domain in d.current_url and "login" not in d.current_url
+            )
+            log.info(f"✓ Connecté — URL : {driver.current_url}")
+
+            # Transférer les cookies vers requests
+            for cookie in driver.get_cookies():
+                self.session.cookies.set(
+                    cookie["name"],
+                    cookie["value"],
+                    domain=cookie.get("domain", "").lstrip("."),
+                )
+                if cookie["name"] == "MoodleSession":
+                    log.info(f"  MoodleSession transférée : {cookie['value'][:12]}...")
+
+        finally:
+            driver.quit()
+
+        time.sleep(1)
+        r = self.session.get(f"{self.base_url}/my/", timeout=30)
+        if "login" in r.url:
+            raise Exception("Session Moodle non établie après connexion navigateur")
+
+        log.info("✓ Session requests opérationnelle")
         return True
 
     # ----------------------------------------------------------
     # LISTE DES COURS
     # ----------------------------------------------------------
     def get_all_courses(self):
-        """Récupère la liste des cours depuis la page 'Mes cours'."""
-        log.info("Recuperation de la liste des cours...")
-        # /my/courses.php charge via JS — on utilise /my/ qui a les liens statiques
+        log.info("Récupération de la liste des cours...")
         r = self.get(f"{self.base_url}/my/")
         if not r:
             r = self.get(f"{self.base_url}/my/courses.php")
@@ -263,7 +329,7 @@ class MoodleScraper:
             raise Exception("Impossible d'accéder aux cours")
 
         soup = BeautifulSoup(r.text, "html.parser")
-        courses = []
+        courses  = []
         seen_ids = set()
 
         for a in soup.find_all("a", href=True):
@@ -275,8 +341,7 @@ class MoodleScraper:
                     if cid in seen_ids:
                         continue
                     seen_ids.add(cid)
-                    name = a.get_text(strip=True) or f"cours_{cid}"
-                    # Nettoyage du nom (enlever doublons genre "Nom\nNom")
+                    name  = a.get_text(strip=True) or f"cours_{cid}"
                     lines = [l.strip() for l in name.splitlines() if l.strip()]
                     name  = lines[0] if lines else name
                     courses.append({
@@ -294,7 +359,6 @@ class MoodleScraper:
     # ASSETS (CSS / JS / FONTS / IMAGES)
     # ----------------------------------------------------------
     def download_asset(self, url, assets_dir):
-        """Télécharge un asset et retourne son chemin local."""
         if not url or not self.is_moodle_url(url):
             return None
         if url in self.assets_done:
@@ -302,7 +366,6 @@ class MoodleScraper:
 
         parsed   = urlparse(url)
         rel_path = parsed.path.lstrip("/")
-        # Enlever les query strings dans le nom de fichier
         local    = assets_dir / rel_path
         local.parent.mkdir(parents=True, exist_ok=True)
 
@@ -312,7 +375,6 @@ class MoodleScraper:
                 with open(local, "wb") as f:
                     for chunk in r.iter_content(8192):
                         f.write(chunk)
-                # Si c'est un CSS, télécharger ses ressources internes
                 if local.suffix.lower() == ".css":
                     self._process_css(local, url, assets_dir)
             else:
@@ -323,27 +385,18 @@ class MoodleScraper:
         return local
 
     def _process_css(self, css_path, css_url, assets_dir):
-        """Parse un CSS et télécharge ses assets référencés (fonts, images)."""
         try:
             text = css_path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             return
-        urls = re.findall(r'url\(["\']?([^"\')\s]+)["\']?\)', text)
-        for u in urls:
-            if u.startswith("data:"):
-                continue
-            abs_u = urljoin(css_url, u)
-            self.download_asset(abs_u, assets_dir)
+        for u in re.findall(r'url\(["\']?([^"\')\s]+)["\']?\)', text):
+            if not u.startswith("data:"):
+                self.download_asset(urljoin(css_url, u), assets_dir)
 
     # ----------------------------------------------------------
-    # TÉLÉCHARGEMENT DE FICHIERS DE COURS
+    # TÉLÉCHARGEMENT DE FICHIERS
     # ----------------------------------------------------------
     def download_resource(self, url, dest_dir):
-        """
-        Télécharge un fichier de ressource Moodle.
-        Suit la redirection pluginfile.php.
-        Retourne le chemin local ou None.
-        """
         dest_dir.mkdir(parents=True, exist_ok=True)
         r = self.get(url, allow_redirects=True, stream=True)
         if not r or r.status_code != 200:
@@ -351,11 +404,9 @@ class MoodleScraper:
             self.files_failed.append({"url": url, "error": str(r.status_code if r else "timeout")})
             return None
 
-        # Nom du fichier
         filename = self._guess_filename(r)
         local    = dest_dir / self.sanitize(filename)
 
-        # Éviter les doublons
         if local.exists():
             base, ext = local.stem, local.suffix
             i = 1
@@ -368,13 +419,11 @@ class MoodleScraper:
                 f.write(chunk)
 
         self.files_downloaded += 1
-        size_kb = local.stat().st_size // 1024
-        log.info(f"  ↓ {local.name} ({size_kb} Ko)")
+        log.info(f"  ↓ {local.name} ({local.stat().st_size // 1024} Ko)")
         return local
 
     def _guess_filename(self, response):
-        """Deduit le nom de fichier depuis les headers ou l'URL."""
-        cd = response.headers.get("Content-Disposition", "")
+        cd   = response.headers.get("Content-Disposition", "")
         name = None
         if "filename*=" in cd:
             m = re.search(r"filename\*=(?:UTF-8'')?([^\s;]+)", cd)
@@ -384,7 +433,6 @@ class MoodleScraper:
             m = re.findall(r'filename=["\']?([^"\';\n]+)', cd)
             if m:
                 raw = m[0].strip('"\'')
-                # Réparer le double encodage latin-1/utf-8 (Ã© → é)
                 try:
                     name = raw.encode("latin-1").decode("utf-8")
                 except (UnicodeEncodeError, UnicodeDecodeError):
@@ -396,13 +444,12 @@ class MoodleScraper:
                 name = raw.encode("latin-1").decode("utf-8")
             except (UnicodeEncodeError, UnicodeDecodeError):
                 name = raw
-        return name if name else "fichier"
+        return name or "fichier"
 
     # ----------------------------------------------------------
     # SCRAPING D'UNE PAGE DE COURS
     # ----------------------------------------------------------
     def scrape_course(self, course, assets_dir):
-        """Scrape une page de cours : HTML + tous les fichiers."""
         safe_name  = self.sanitize(course["name"])
         course_dir = self.output_dir / "cours" / safe_name
         files_dir  = course_dir / "fichiers"
@@ -414,49 +461,36 @@ class MoodleScraper:
 
         r = self.get(course["url"])
         if not r:
-            log.error(f"  ✗ Impossible d'accéder au cours")
+            log.error("  ✗ Impossible d'accéder au cours")
             return None
         soup = BeautifulSoup(r.text, "html.parser")
 
-        html_path = course_dir / "index.html"
-
-        # --- Télécharger les fichiers et collecter le mapping URL→local ---
+        html_path  = course_dir / "index.html"
         activities = self._parse_activities(soup)
         log.info(f"  → {len(activities)} activités trouvées")
 
         for act in activities:
             if not act["href"]:
                 continue
-
             if act["type"] == "resource":
                 local = self.download_resource(act["href"], files_dir)
                 if local:
                     self.url_map[act["href"]] = local
-
             elif act["type"] == "folder":
                 self._scrape_folder(act["href"], files_dir, assets_dir)
-
             elif act["type"] == "page":
                 local = self._scrape_moodle_page(act["href"], pages_dir, assets_dir, course_dir)
                 if local:
                     self.url_map[act["href"]] = local
 
-            elif act["type"] == "url":
-                # Lien externe : on garde l'URL d'origine
-                pass
-
-            # forums, quiz, assign… : on garde les liens tels quels
-
-        # --- Réécrire la page HTML ---
         soup = self._rewrite_page(soup, html_path, assets_dir)
         self._save_html(soup, html_path)
         self.pages_saved += 1
         self.url_map[course["url"]] = html_path
-        log.info(f"  ✓ Page cours sauvegardée")
+        log.info("  ✓ Page cours sauvegardée")
         return course_dir
 
     def _parse_activities(self, soup):
-        """Retourne la liste des activités d'une page de cours."""
         acts = []
         for li in soup.find_all("li", class_="activity"):
             classes  = li.get("class", [])
@@ -465,23 +499,22 @@ class MoodleScraper:
             a = li.find("a", href=True)
             if not a:
                 continue
-            href = self.abs_url(a["href"])
+            href     = self.abs_url(a["href"])
             name_tag = (li.find(class_="instancename") or
                         li.find(class_="activityname") or a)
-            name = name_tag.get_text(strip=True) if name_tag else ""
-            acts.append({"type": mod_type, "name": name, "href": href})
+            acts.append({"type": mod_type,
+                         "name": name_tag.get_text(strip=True) if name_tag else "",
+                         "href": href})
         return acts
 
     def _scrape_moodle_page(self, url, pages_dir, assets_dir, course_dir):
-        """Scrape une activité 'Page' Moodle (contenu HTML inline)."""
         r = self.get(url)
         if not r or r.status_code != 200:
             return None
-        soup      = BeautifulSoup(r.text, "html.parser")
-        # Extraire un nom propre depuis le titre
-        title     = soup.find("title")
-        name      = title.get_text(strip=True).split("|")[0].strip() if title else "page"
-        filename  = self.sanitize(name) + ".html"
+        soup     = BeautifulSoup(r.text, "html.parser")
+        title    = soup.find("title")
+        name     = title.get_text(strip=True).split("|")[0].strip() if title else "page"
+        filename = self.sanitize(name) + ".html"
         pages_dir.mkdir(parents=True, exist_ok=True)
         html_path = pages_dir / filename
 
@@ -492,26 +525,21 @@ class MoodleScraper:
         return html_path
 
     def _scrape_folder(self, url, files_dir, assets_dir):
-        """Scrape un dossier Moodle et télécharge tous ses fichiers."""
         r = self.get(url)
         if not r:
             return
         soup = BeautifulSoup(r.text, "html.parser")
         for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "/pluginfile.php/" in href:
-                abs_href = self.abs_url(href)
-                local = self.download_resource(abs_href, files_dir)
+            if "/pluginfile.php/" in a["href"]:
+                abs_href = self.abs_url(a["href"])
+                local    = self.download_resource(abs_href, files_dir)
                 if local:
                     self.url_map[abs_href] = local
 
     # ----------------------------------------------------------
-    # RÉÉCRITURE DES LIENS POUR NAVIGATION HORS LIGNE
+    # RÉÉCRITURE DES LIENS
     # ----------------------------------------------------------
     def _rewrite_page(self, soup, html_path, assets_dir):
-        """Réécrit tous les liens d'une page pour usage hors ligne."""
-
-        # CSS
         for tag in soup.find_all("link", rel=True):
             if "stylesheet" in tag.get("rel", []):
                 href = self.abs_url(tag.get("href", ""))
@@ -520,7 +548,6 @@ class MoodleScraper:
                     if local:
                         tag["href"] = self.relpath(local, html_path)
 
-        # JS
         for tag in soup.find_all("script", src=True):
             src = self.abs_url(tag["src"])
             if src and self.is_moodle_url(src):
@@ -528,7 +555,6 @@ class MoodleScraper:
                 if local:
                     tag["src"] = self.relpath(local, html_path)
 
-        # Images
         for tag in soup.find_all("img", src=True):
             src = self.abs_url(tag["src"])
             if src and self.is_moodle_url(src):
@@ -536,43 +562,35 @@ class MoodleScraper:
                 if local:
                     tag["src"] = self.relpath(local, html_path)
 
-        # Liens de cours et ressources → fichiers locaux
         for tag in soup.find_all("a", href=True):
             href = self.abs_url(tag["href"])
             if href in self.url_map:
-                local = self.url_map[href]
-                tag["href"] = self.relpath(local, html_path)
+                tag["href"] = self.relpath(self.url_map[href], html_path)
 
-        # Supprimer les balises <base> qui cassent la navigation hors ligne
         for tag in soup.find_all("base"):
             tag.decompose()
 
         return soup
 
     def _save_html(self, soup, path):
-        """Sauvegarde le HTML proprement."""
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write("<!DOCTYPE html>\n")
             f.write(str(soup))
 
     # ----------------------------------------------------------
-    # PAGE D'INDEX (LISTE DES COURS)
+    # PAGE D'INDEX
     # ----------------------------------------------------------
     def build_index(self, courses, assets_dir):
-        """Crée index.html à partir de la page 'Mes cours'."""
         log.info("\nCréation de la page d'accueil...")
-
         r = self.get(f"{self.base_url}/my/courses.php") or self.get(f"{self.base_url}/my/")
         if not r:
-            log.warning("  Impossible de récupérer la page d'accueil, création manuelle")
             self._build_simple_index(courses)
             return
 
         soup     = BeautifulSoup(r.text, "html.parser")
         idx_path = self.output_dir / "index.html"
 
-        # Réécrire les liens de cours
         for a in soup.find_all("a", href=True):
             href = self.abs_url(a["href"])
             if href in self.url_map:
@@ -584,18 +602,17 @@ class MoodleScraper:
         log.info(f"✓ Index créé : {idx_path}")
 
     def _build_simple_index(self, courses):
-        """Page d'index de secours si la récupération du dashboard échoue."""
         idx_path = self.output_dir / "index.html"
-        items = ""
-        for c in courses:
-            safe  = self.sanitize(c["name"])
-            items += f'<li><a href="cours/{safe}/index.html">{c["name"]}</a></li>\n'
+        items = "".join(
+            f'<li><a href="cours/{self.sanitize(c["name"])}/index.html">{c["name"]}</a></li>\n'
+            for c in courses
+        )
         html = f"""<!DOCTYPE html>
 <html lang="fr"><head><meta charset="UTF-8">
 <title>Moodle Offline – {self.base_url}</title>
 <style>
   body {{ font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; }}
-  h1 {{ color: #c00; }} ul {{ line-height: 2; }} a {{ color: #003d7a; }}
+  h1 {{ color: #003d7a; }} ul {{ line-height: 2; }} a {{ color: #003d7a; }}
 </style></head><body>
 <h1>Mes cours — Moodle Offline</h1>
 <p>Site : <code>{self.base_url}</code></p>
@@ -609,44 +626,36 @@ class MoodleScraper:
     # LANCEMENT PRINCIPAL
     # ----------------------------------------------------------
     def run(self):
-        """Point d'entrée : scraping complet."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         assets_dir = self.output_dir / "assets"
         assets_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Connexion
         self.login()
-
-        # 2. Liste des cours
         courses = self.get_all_courses()
 
         if self.test_mode:
             courses = courses[:2]
             log.info(f"\n[MODE TEST] Limité à {len(courses)} cours")
         elif self.max_courses:
-            courses = courses[: self.max_courses]
+            courses = courses[:self.max_courses]
 
-        # 3. Scraper chaque cours
         for i, course in enumerate(courses, 1):
             log.info(f"\n[{i}/{len(courses)}]")
             try:
                 self.scrape_course(course, assets_dir)
             except KeyboardInterrupt:
-                log.warning("Interruption clavier — arrêt propre.")
+                log.warning("Interruption — arrêt propre.")
                 break
             except Exception as e:
                 log.error(f"  ✗ Erreur cours '{course['name']}': {e}")
 
-        # 4. Index
         self.build_index(courses, assets_dir)
 
-        # 5. Mapping JSON
         mapping = {k: str(v) for k, v in self.url_map.items()}
         (self.output_dir / "mapping.json").write_text(
             json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
-        # 6. Résumé
         duration = int(time.time() - self.start_time)
         log.info(f"""
 {'='*60}
@@ -671,16 +680,17 @@ Durée totale             : {duration // 60}m {duration % 60}s
 # ============================================================
 # POINT D'ENTRÉE
 # ============================================================
-
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Moodle Offline Scraper — crée un miroir local navigable"
+        description="Moodle Offline Scraper — crée un miroir local navigable de n'importe quel Moodle"
+    )
+    parser.add_argument(
+        "--url", type=str,
+        help="URL du Moodle (ex: https://moodle.psl.eu). Demandé au lancement si absent."
     )
     parser.add_argument(
         "--test", action="store_true",
-        help="Mode test : scrape seulement 2 cours (validation rapide)"
+        help="Mode test : scrape seulement 2 cours"
     )
     parser.add_argument(
         "--courses", type=int, metavar="N",
@@ -688,29 +698,38 @@ def main():
     )
     parser.add_argument(
         "--output", type=str,
-        help=f"Dossier de sortie (défaut : {OUTPUT_DIR})"
+        help="Dossier de sortie (défaut : moodle_offline_<domaine>)"
     )
     args = parser.parse_args()
 
+    # Demander l'URL si pas fournie
+    moodle_url = args.url
+    if not moodle_url:
+        moodle_url = input("URL du Moodle (ex: https://moodle.psl.eu) : ").strip()
+    if not moodle_url.startswith("http"):
+        moodle_url = "https://" + moodle_url
+    moodle_url = moodle_url.rstrip("/")
+
+    # Dossier de sortie basé sur le domaine
+    domain = urlparse(moodle_url).netloc
+    base_dir = Path(__file__).parent
+    output_dir = Path(args.output) if args.output else base_dir / f"moodle_offline_{domain}"
+    log_file   = base_dir / f"moodle_scraper_{domain}.log"
+
+    setup_logging(log_file)
 
     print("=" * 60)
-    print("   MOODLE OFFLINE SCRAPER")
-    print(f"   Site : {MOODLE_URL}")
+    print("   MOODLE OFFLINE SCRAPER — Universel")
+    print(f"   Site   : {moodle_url}")
+    print(f"   Sortie : {output_dir}")
     if args.test:
         print("   [MODE TEST — 2 cours maximum]")
     print("=" * 60)
-
-    # Les identifiants peuvent aussi être passés via variables d'environnement :
-    #   MOODLE_USERNAME et MOODLE_PASSWORD
-    username = os.environ.get("MOODLE_USERNAME") or input("Email / username : ").strip()
-    password = os.environ.get("MOODLE_PASSWORD") or getpass.getpass("Mot de passe    : ")
-
-    output = Path(args.output) if args.output else OUTPUT_DIR
+    print()
 
     scraper = MoodleScraper(
-        username=username,
-        password=password,
-        output_dir=output,
+        moodle_url=moodle_url,
+        output_dir=output_dir,
         test_mode=args.test,
         max_courses=args.courses,
     )
